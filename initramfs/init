@@ -1,0 +1,285 @@
+#!/bin/sh
+# init — PID 1 for self-update initramfs
+# Mounts filesystems, sets up network/SSH helpers, then discovers and runs payload
+
+# Strict error handling for setup, relaxed later for interactive use
+set -e
+
+# Ignore SIGPIPE — critical for PID 1, since a broken log pipe must not kill init
+trap '' PIPE
+
+echo ""
+echo "============================================"
+echo "  Raspberry Pi Self-Update Initramfs"
+echo "============================================"
+echo ""
+
+# Mount essential filesystems
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts
+mount -t tmpfs -o size=80% tmpfs /tmp
+mount -t tmpfs tmpfs /run
+
+# Start logging — use a fifo so plain sh can tee to console and log file
+mkfifo /tmp/logpipe
+tee /tmp/selfupdate.log < /tmp/logpipe &
+exec > /tmp/logpipe 2>&1
+
+echo "Kernel: $(uname -r) ($(uname -m))"
+echo "Cmdline: $(cat /proc/cmdline)"
+echo ""
+
+# Set hostname
+if [ -f /etc/hostname ]; then
+    INITRAMFS_HOSTNAME=$(cat /etc/hostname)
+    hostname "$INITRAMFS_HOSTNAME"
+    echo "Hostname: $INITRAMFS_HOSTNAME"
+fi
+
+# Populate /dev with mdev
+echo "Populating /dev..."
+mdev -s
+echo "Waiting for devices to settle..."
+sleep 5
+mdev -s
+
+# Dump kernel log into the running log file (the logpipe tee picks it up).
+# Use this just before copying /tmp/selfupdate.log to /boot/... so the saved
+# log includes the latest firmware-load, WiFi association, and other kernel
+# messages. Also called once at end of init so module/firmware issues land
+# in the log even when there's no payload (rescue shell).
+dump_dmesg() {
+    echo ""
+    echo "=== Kernel log (dmesg) ==="
+    dmesg 2>/dev/null || echo "(dmesg unavailable)"
+    echo "=== end dmesg ==="
+    echo ""
+}
+
+# Load kernel modules. Two possible layouts:
+#   /lib/modules/<kver>/*.ko  — usbboot (multi-kernel), pick subdir matching uname -r
+#   /lib/modules/*.ko         — tryboot (single-kernel, built for this host)
+#
+# rpi-initramfs writes a "loadorder" file alongside the .ko files when it
+# builds the image. install_kmod is recursive (deps-first), so the order
+# modules are appended to loadorder is already a valid topological order.
+# We follow that order with one pass of insmod — no retries, no "Unknown
+# symbol" dmesg noise from premature load attempts.
+#
+# HID modules are held back to the end of the pass so they claim devices
+# only after other drivers have had a chance to bind.
+MOD_DIR=""
+if [ -d "/lib/modules/$(uname -r)" ]; then
+    MOD_DIR="/lib/modules/$(uname -r)"
+elif ls /lib/modules/*.ko >/dev/null 2>&1; then
+    MOD_DIR="/lib/modules"
+fi
+
+if [ -n "$MOD_DIR" ] && [ -f "$MOD_DIR/loadorder" ]; then
+    echo "Loading kernel modules from $MOD_DIR (deps-first)..."
+    HID_MODS=""
+    while IFS= read -r mod; do
+        [ -n "$mod" ] || continue
+        [ -f "$MOD_DIR/${mod}.ko" ] || continue
+        case "$mod" in hid_*|hid-*) HID_MODS="$HID_MODS $mod"; continue ;; esac
+        if grep -q "^${mod} " /proc/modules 2>/dev/null; then
+            continue
+        fi
+        if insmod "$MOD_DIR/${mod}.ko" 2>/dev/null; then
+            echo "  $mod"
+        else
+            echo "  WARNING: failed to load $mod"
+        fi
+    done < "$MOD_DIR/loadorder"
+    for mod in $HID_MODS; do
+        if insmod "$MOD_DIR/${mod}.ko" 2>/dev/null; then
+            echo "  $mod"
+        fi
+    done
+    # Re-scan devices so drivers can claim them
+    sleep 1
+    mdev -s
+fi
+
+# Capture kernel log after module load so module/firmware issues are in
+# /tmp/selfupdate.log even when we never get further (e.g. rescue shell).
+dump_dmesg
+
+# Bind framebuffer to VT console (needed for keyboard + display)
+if [ -e /dev/fb0 ] && [ -d /sys/class/vtconsole/vtcon0 ]; then
+    echo "Binding framebuffer console..."
+    echo 1 > /sys/class/vtconsole/vtcon0/bind 2>/dev/null || true
+fi
+
+# USB gadget serial console (for usbboot mode) — modules are loaded above;
+# this just spawns a shell on /dev/ttyGS0 if the gadget came up.
+if [ -c /dev/ttyGS0 ]; then
+    setsid sh -c 'exec sh </dev/ttyGS0 >/dev/ttyGS0 2>&1' &
+    echo "USB serial console available on /dev/ttyGS0"
+fi
+
+# Find and mount the boot partition
+echo "=== Mounting boot partition ==="
+BOOT_MOUNTED=0
+
+# Try PARTUUID from the backup cmdline if available, or from config
+# First try known PARTUUIDs for the boot partition (part 1 of the same disk)
+for dev in $(blkid -o device 2>/dev/null); do
+    uuid=$(blkid -s PARTUUID -o value "$dev" 2>/dev/null || true)
+    fstype=$(blkid -s TYPE -o value "$dev" 2>/dev/null || true)
+    if [ "$fstype" = "vfat" ] && [ -n "$uuid" ]; then
+        echo "Trying boot partition: $dev (PARTUUID=$uuid, type=$fstype)"
+        if mount -t vfat "$dev" /boot 2>/dev/null; then
+            if [ -f /boot/config.txt ]; then
+                echo "Mounted boot partition: $dev -> /boot"
+                BOOT_MOUNTED=1
+                BOOT_DEV="$dev"
+                break
+            else
+                umount /boot
+            fi
+        fi
+    fi
+done
+
+# Fallback: try common boot partition device paths
+if [ "$BOOT_MOUNTED" = "0" ]; then
+    for dev in /dev/nvme0n1p1 /dev/mmcblk0p1 /dev/sda1; do
+        if [ -b "$dev" ]; then
+            echo "Trying fallback: $dev"
+            if mount -t vfat "$dev" /boot 2>/dev/null; then
+                if [ -f /boot/config.txt ]; then
+                    echo "Mounted boot partition: $dev -> /boot"
+                    BOOT_MOUNTED=1
+                    BOOT_DEV="$dev"
+                    break
+                else
+                    umount /boot
+                fi
+            fi
+        fi
+    done
+fi
+
+if [ "$BOOT_MOUNTED" = "0" ]; then
+    echo "ERROR: Could not find and mount boot partition"
+    echo ""
+    echo "Available block devices:"
+    blkid 2>/dev/null || echo "(blkid not available)"
+    echo ""
+    echo "Dropping to shell."
+    set +e
+    exec setsid sh -c 'exec sh </dev/console >/dev/console 2>&1'
+fi
+
+# === Helper functions (available to payload scripts) ===
+
+# Clean up tryboot files from boot partition
+restore_boot() {
+    echo ""
+    echo "=== Cleaning up tryboot files ==="
+    rm -f /boot/tryboot.txt /boot/cmdline-tryboot.txt /boot/initramfs-tryboot.gz
+    sync
+    echo "Tryboot files removed. Next reboot will boot normally."
+}
+
+# Start network and optional SSH server
+start_network_and_ssh() {
+    # WiFi creds embedded by rpi-initramfs --wifi-ssid/--wifi-psk (used in
+    # the bare-initramfs case). The payload (rpi-self-update flash) sets
+    # WIFI_SSID via selfupdate.conf instead — both paths end up populating
+    # the same env vars before network.sh runs.
+    [ -f /etc/wifi.env ] && . /etc/wifi.env
+    . /scripts/network.sh
+    setup_network
+    NETWORK_RC=$?
+
+    if [ $NETWORK_RC -ne 0 ]; then
+        echo ""
+        echo "WARNING: Network setup failed"
+        echo "Dropping to shell. Try manually:"
+        echo "  ip link set eth0 up"
+        echo "  udhcpc -i eth0 -s /scripts/udhcpc.script"
+        return 1
+    fi
+
+    # Start SSH server if dropbear is available
+    if [ -x /usr/sbin/dropbear ]; then
+        echo "Starting SSH server (dropbear)..."
+        mkdir -p /var/log
+        : > /var/log/lastlog
+        /usr/sbin/dropbear -R -p 22 2>&1 || echo "WARNING: dropbear failed to start"
+        LOCAL_IP=$(ip -4 addr show | grep 'inet ' | grep -v '127.0.0.1' | awk '{print $2}' | cut -d/ -f1 | head -1)
+        echo "SSH available: ssh root@${LOCAL_IP:-<ip>}"
+    fi
+    return 0
+}
+
+# Drop to interactive shell
+drop_to_shell() {
+    cat /etc/motd 2>/dev/null
+    set +e
+    exec setsid sh -c 'exec sh </dev/console >/dev/console 2>&1'
+}
+
+# === Payload execution ===
+
+PAYLOAD_DIR="/payload"
+export BOOT_DEV PAYLOAD_DIR
+
+# Persist env for SSH sessions and the reboot wrapper
+cat > /etc/profile <<PROFILE
+export BOOT_DEV="$BOOT_DEV"
+export PAYLOAD_DIR="$PAYLOAD_DIR"
+export PATH="/sbin:/usr/sbin:/bin:/usr/bin"
+PROFILE
+
+if [ -f /payload/initramfs-run ]; then
+    set +e
+    . /payload/initramfs-run
+else
+    echo ""
+    echo "No payload — rescue mode."
+    set +e
+    NETWORK_OK=0
+    start_network_and_ssh && NETWORK_OK=1
+
+    # Always persist the log before any reboot path — /tmp lives in
+    # tmpfs and would be lost on power cycle / force-reboot otherwise.
+    dump_dmesg
+    sync
+    if grep -q ' /boot ' /proc/mounts 2>/dev/null; then
+        cp /tmp/selfupdate.log /boot/selfupdate-rescue.log 2>/dev/null && \
+            echo "Log saved to /boot/selfupdate-rescue.log"
+        sync
+    fi
+
+    if [ "$NETWORK_OK" = "1" ]; then
+        drop_to_shell
+    else
+        # No network = no SSH = no remote recovery. Auto-restore the
+        # boot config and reboot back to the normal OS. Mirrors the
+        # flash-mode failure handler.
+        echo ""
+        echo "=============================================="
+        echo "  Network unavailable — auto-rebooting to normal OS."
+        echo "=============================================="
+        echo "(Waiting 30s. 'touch /tmp/hold' from the console to stay"
+        echo " in the initramfs.)"
+        i=0
+        while [ $i -lt 30 ]; do
+            [ -f /tmp/hold ] && { echo "Auto-reboot cancelled."; drop_to_shell; }
+            sleep 1
+            i=$((i + 1))
+        done
+        restore_boot
+        sync
+        echo "Rebooting..."
+        reboot -f 2>/dev/null
+        sleep 3
+        echo b > /proc/sysrq-trigger
+    fi
+fi

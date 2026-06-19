@@ -1,0 +1,15 @@
+output/
+build/
+*.deb
+
+# Local Claude Code config
+.claude/
+
+# Debian build artifacts
+debian/data/
+debian/.debhelper/
+debian/debhelper-build-stamp
+debian/files
+debian/*.substvars
+debian/rpi-self-update/
+

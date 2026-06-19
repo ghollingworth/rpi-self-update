@@ -1,0 +1,26 @@
+#!/usr/bin/make -f
+
+export DH_VERBOSE = 1
+
+%:
+	dh $@
+
+override_dh_auto_install:
+	# Executables
+	install -D -m 755 rpi-initramfs      debian/rpi-self-update/usr/sbin/rpi-initramfs
+	install -D -m 755 rpi-self-update    debian/rpi-self-update/usr/sbin/rpi-self-update
+	install -D -m 755 rpi-self-update-cli debian/rpi-self-update/usr/sbin/rpi-self-update-cli
+
+	# Initramfs sources
+	install -D -m 755 initramfs/init                    debian/rpi-self-update/usr/share/rpi-self-update/initramfs/init
+	install -D -m 755 initramfs/scripts/network.sh      debian/rpi-self-update/usr/share/rpi-self-update/initramfs/scripts/network.sh
+	install -D -m 755 initramfs/scripts/udhcpc.script   debian/rpi-self-update/usr/share/rpi-self-update/initramfs/scripts/udhcpc.script
+	install -D -m 755 initramfs/scripts/restore          debian/rpi-self-update/usr/share/rpi-self-update/initramfs/scripts/restore
+
+	# Payload
+	install -D -m 755 payload/initramfs-run     debian/rpi-self-update/usr/share/rpi-self-update/payload/initramfs-run
+	install -D -m 755 payload/flash.sh          debian/rpi-self-update/usr/share/rpi-self-update/payload/flash.sh
+	install -D -m 755 payload/preserve-home.sh  debian/rpi-self-update/usr/share/rpi-self-update/payload/preserve-home.sh
+	install -D -m 755 payload/preserve-ssh.sh   debian/rpi-self-update/usr/share/rpi-self-update/payload/preserve-ssh.sh
+
+override_dh_auto_test:

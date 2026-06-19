@@ -1,0 +1,38 @@
+#!/bin/sh
+# restore — clean up tryboot files and reboot back to the normal OS
+#
+# Installed to /sbin/restore in the initramfs. Type "restore" from any
+# shell (console or SSH) to return the Pi to normal boot.
+#
+# With tryboot, the normal boot config was never modified — we just need
+# to remove the tryboot files. Even without running this, a hard reboot
+# or power cycle will boot normally since tryboot is one-shot.
+
+echo ""
+echo "=== Cleaning up tryboot files and rebooting ==="
+
+# Pick up BOOT_DEV if not already in environment (e.g. SSH session)
+[ -z "${BOOT_DEV:-}" ] && [ -f /etc/profile ] && . /etc/profile
+
+# Remount boot if needed (may have been unmounted during flash)
+if ! grep -q ' /boot ' /proc/mounts 2>/dev/null; then
+    if [ -n "${BOOT_DEV:-}" ]; then
+        mount -t vfat "$BOOT_DEV" /boot 2>/dev/null
+    fi
+fi
+
+if grep -q ' /boot ' /proc/mounts 2>/dev/null; then
+    rm -f /boot/tryboot.txt /boot/cmdline-tryboot.txt /boot/initramfs-tryboot.gz
+    sync
+    echo "Tryboot files removed."
+else
+    echo "WARNING: Boot partition not mounted — tryboot files not cleaned up."
+    echo "Next hard reboot will still boot normally (tryboot is one-shot)."
+fi
+
+echo "Rebooting..."
+sleep 1
+/bin/busybox reboot -f
+# Fallback
+sleep 3
+echo b > /proc/sysrq-trigger

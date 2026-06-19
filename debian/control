@@ -1,0 +1,13 @@
+Source: rpi-self-update
+Section: admin
+Priority: optional
+Maintainer: Gordon <gordon@localhost>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.0
+
+Package: rpi-self-update
+Architecture: arm64
+Depends: e2fsprogs, fdisk, ca-certificates, util-linux, jq, curl, busybox-static, dropbear-bin, wpasupplicant, iw, firmware-brcm80211
+Description: Raspberry Pi self-update tool
+ Build an initramfs that can download, flash, and verify a new OS image
+ on a Raspberry Pi, preserving home directories and SSH keys.

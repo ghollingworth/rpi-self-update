@@ -1,0 +1,64 @@
+name: Build .deb
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'debian/**'
+      - 'initramfs/**'
+      - 'payload/**'
+      - 'rpi-initramfs'
+      - 'rpi-self-update'
+      - 'rpi-self-update-cli'
+      - '.github/workflows/build.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write   # needed to create a release on tag pushes
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential debhelper
+
+      - name: Verify tag matches debian/changelog version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          deb_version=$(dpkg-parsechangelog -SVersion)
+          # deb_version looks like "0.2.14-1"; tag is "0.2.14"
+          if [ "${deb_version%-*}" != "$tag" ]; then
+            echo "ERROR: tag v$tag does not match debian/changelog version $deb_version" >&2
+            exit 1
+          fi
+          echo "OK: tag v$tag matches changelog $deb_version"
+
+      - name: Build .deb
+        run: dpkg-buildpackage -us -uc -b
+
+      - name: Stage artifacts
+        run: |
+          mkdir -p artifacts
+          mv ../rpi-self-update_*.deb artifacts/
+          ls -la artifacts/
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpi-self-update-deb
+          path: artifacts/*.deb
+
+      - name: Create GitHub Release (tag push only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.deb
+          generate_release_notes: true

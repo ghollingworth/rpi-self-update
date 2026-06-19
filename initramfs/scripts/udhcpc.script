@@ -1,0 +1,34 @@
+#!/bin/sh
+# udhcpc callback script — handles DHCP lease events
+
+case "$1" in
+    deconfig)
+        ip addr flush dev "$interface"
+        ip link set "$interface" up
+        ;;
+
+    bound|renew)
+        # Set IP address
+        ip addr flush dev "$interface"
+        ip addr add "$ip/${mask:-24}" dev "$interface"
+
+        # Set default route
+        if [ -n "${router:-}" ]; then
+            ip route add default via "$router" dev "$interface"
+        fi
+
+        # Write DNS config
+        if [ -n "${dns:-}" ]; then
+            : > /etc/resolv.conf
+            for ns in $dns; do
+                echo "nameserver $ns" >> /etc/resolv.conf
+            done
+        fi
+
+        echo "DHCP $1: $interface $ip/${mask:-24} gw=${router:-none} dns=${dns:-none}"
+        ;;
+
+    nak)
+        echo "DHCP NAK received on $interface"
+        ;;
+esac

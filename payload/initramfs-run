@@ -1,0 +1,279 @@
+#!/bin/sh
+# initramfs-run — self-update payload for Raspberry Pi initramfs
+#
+# Sourced by init after boot partition is mounted and payload copied to RAM.
+# Has access to: restore_boot, start_network_and_ssh, drop_to_shell
+# Has access to: BOOT_DEV, PAYLOAD_DIR
+
+# Source configuration
+if [ ! -f "$PAYLOAD_DIR/selfupdate.conf" ]; then
+    echo "ERROR: selfupdate.conf not found in payload"
+    drop_to_shell
+fi
+
+echo ""
+echo "=== Configuration ==="
+cat "$PAYLOAD_DIR/selfupdate.conf"
+echo ""
+
+. "$PAYLOAD_DIR/selfupdate.conf"
+
+# Validate required fields
+if [ -z "${MODE:-}" ]; then
+    echo "ERROR: MODE not set in selfupdate.conf"
+    drop_to_shell
+fi
+
+# Log environment info
+echo "=== Environment ==="
+echo "Date: $(date 2>/dev/null || echo 'unknown')"
+echo "Boot device: ${BOOT_DEV:-unknown}"
+echo ""
+echo "Block devices:"
+blkid 2>/dev/null || echo "(none)"
+echo ""
+echo "Network interfaces:"
+ls /sys/class/net/ 2>/dev/null
+echo ""
+
+# ==================== FLASH MODE ====================
+if [ "$MODE" = "flash" ]; then
+
+    # Relax error handling for network/flash operations
+    set +e
+
+    # Set up network and SSH. Retry a few times — carrier may take a moment,
+    # the AP may be slow to respond, etc.
+    . "$PAYLOAD_DIR/preserve-home.sh"
+    [ -f "$PAYLOAD_DIR/preserve-ssh.sh" ] && . "$PAYLOAD_DIR/preserve-ssh.sh"
+    NETWORK_OK=0
+    for attempt in 1 2 3; do
+        echo ""
+        echo "--- Network attempt $attempt/3 ---"
+        start_network_and_ssh && { NETWORK_OK=1; break; }
+        [ "$attempt" -lt 3 ] && { echo "Waiting 15s before retry..."; sleep 15; }
+    done
+
+    if [ "$NETWORK_OK" != "1" ]; then
+        echo ""
+        echo "=============================================="
+        echo "  Network unavailable — aborting update."
+        echo "=============================================="
+        echo ""
+        echo "Nothing has been written to disk. Cleaning up"
+        echo "tryboot files and rebooting to the normal OS."
+
+        # Save the log to the original boot partition so the user can
+        # diagnose what went wrong after the reboot. /boot is still
+        # mounted here — the unmount-for-flash step hasn't run yet.
+        dump_dmesg
+        sync
+        cp /tmp/selfupdate.log /boot/selfupdate-failure.log 2>/dev/null && \
+            echo "Log saved to /boot/selfupdate-failure.log"
+
+        echo "(Waiting 30s in case someone wants to SSH in —"
+        echo "'touch /tmp/hold' to stop auto-reboot.)"
+        i=0
+        while [ $i -lt 30 ]; do
+            [ -f /tmp/hold ] && { echo "Auto-reboot cancelled."; drop_to_shell; }
+            sleep 1
+            i=$((i + 1))
+        done
+        # Re-copy the log in case more went to it during the wait
+        dump_dmesg
+        cp /tmp/selfupdate.log /boot/selfupdate-failure.log 2>/dev/null
+        sync
+        restore_boot
+        sync
+        echo "Rebooting..."
+        reboot -f 2>/dev/null
+        sleep 3
+        echo b > /proc/sysrq-trigger
+        exit 0
+    fi
+
+    echo ""
+    echo "============================================"
+    echo "  FLASH MODE"
+    if [ "${SELF_UPDATE:-0}" = "1" ]; then
+        echo "  ** SELF-UPDATE **"
+    fi
+    echo "============================================"
+    echo ""
+
+    # Validate required config
+    if [ -z "${IMAGE_URL:-}" ] || [ -z "${TARGET_DEVICE:-}" ]; then
+        echo "ERROR: IMAGE_URL and TARGET_DEVICE are required for flash mode"
+        drop_to_shell
+    fi
+
+    # Display summary
+    echo "Image:  ${IMAGE_NAME:-unknown}"
+    echo "URL:    $IMAGE_URL"
+    echo "Target: $TARGET_DEVICE"
+    echo "SHA256: ${IMAGE_SHA256:-none}"
+    echo "Self:   ${SELF_UPDATE:-0}"
+    echo ""
+
+    # No confirmation here — user already confirmed in prepare.sh before rebooting
+    echo "Proceeding with flash (confirmed in prepare.sh)..."
+
+    echo ""
+
+    # For self-update: copy cloud-init to RAM and unmount boot before flashing
+    if [ "${SELF_UPDATE:-0}" = "1" ]; then
+        echo "Self-update: saving cloud-init config to RAM..."
+        if [ -d "$PAYLOAD_DIR/selfupdate-cloudinit" ]; then
+            cp -r "$PAYLOAD_DIR/selfupdate-cloudinit" /tmp/selfupdate-cloudinit
+            echo "  Copied cloud-init files to /tmp"
+        fi
+        echo "Self-update: unmounting boot partition before flash..."
+        sync
+        umount /boot
+        echo "  Boot partition unmounted — target device is free"
+
+        # Preserve home directory if requested
+        if [ "${PRESERVE_HOME:-0}" = "1" ]; then
+            echo ""
+            echo "Preserve home requested — backing up..."
+            preserve_home_backup "$TARGET_DEVICE"
+            BACKUP_RC=$?
+            if [ $BACKUP_RC -eq 2 ]; then
+                echo ""
+                echo "Home backup failed — aborting self-update."
+                echo "Tryboot is one-shot — a reboot will return to normal system."
+                echo "Dropping to shell."
+                drop_to_shell
+            fi
+        fi
+
+        # Preserve SSH host keys if requested
+        if [ "${PRESERVE_SSH:-0}" = "1" ]; then
+            echo ""
+            echo "Preserve SSH requested — backing up host keys..."
+            preserve_ssh_backup "$TARGET_DEVICE" || \
+                echo "WARNING: SSH backup failed (continuing — host keys won't be preserved)"
+        fi
+    fi
+
+    # Flash
+    . "$PAYLOAD_DIR/flash.sh"
+    flash_image
+    FLASH_RC=$?
+
+    if [ "${SELF_UPDATE:-0}" = "1" ]; then
+        # Restore home directory if we backed it up
+        if [ -f /tmp/preserve-home.state ]; then
+            echo ""
+            echo "Preserve home state found — restoring..."
+            preserve_home_restore "$TARGET_DEVICE" || echo "WARNING: Home restore failed (continuing with boot)"
+        fi
+
+        # Restore SSH host keys if we backed them up
+        if [ -f /tmp/preserve-ssh.state ]; then
+            preserve_ssh_restore "$TARGET_DEVICE" || echo "WARNING: SSH restore failed (continuing with boot)"
+        fi
+
+        # Self-update: mount the NEW boot partition (written by the fresh image)
+        echo ""
+        echo "=== Mounting new boot partition ==="
+        sleep 2
+        mdev -s
+
+        # The new image has a fresh partition table on the same device
+        NEW_BOOT=""
+        case "$TARGET_DEVICE" in
+            /dev/mmcblk*|/dev/nvme*)
+                NEW_BOOT="${TARGET_DEVICE}p1" ;;
+            /dev/sd*)
+                NEW_BOOT="${TARGET_DEVICE}1" ;;
+        esac
+
+        if [ -n "$NEW_BOOT" ] && [ -b "$NEW_BOOT" ]; then
+            if mount -t vfat "$NEW_BOOT" /boot 2>&1; then
+                echo "Mounted new boot partition: $NEW_BOOT"
+
+                # Save log to new boot partition
+                dump_dmesg
+                cp /tmp/selfupdate.log /boot/selfupdate-flash.log 2>/dev/null || true
+                echo "Log saved as selfupdate-flash.log"
+
+                if [ -d /tmp/selfupdate-cloudinit ]; then
+                    cp /tmp/selfupdate-cloudinit/meta-data /boot/meta-data
+                    cp /tmp/selfupdate-cloudinit/user-data /boot/user-data
+                    cp /tmp/selfupdate-cloudinit/network-config /boot/network-config
+                    echo "Installed cloud-init files on new boot partition"
+
+                    # Enable SSH — RPi OS native trigger
+                    touch /boot/ssh
+                    echo "Created /boot/ssh (enables SSH on first boot)"
+
+                    # Append NoCloud datasource to new cmdline.txt
+                    if [ -f /boot/cmdline.txt ] && [ -f /tmp/selfupdate-cloudinit/cmdline-append ]; then
+                        APPEND=$(cat /tmp/selfupdate-cloudinit/cmdline-append)
+                        if ! grep -q "ds=nocloud" /boot/cmdline.txt; then
+                            sed -i "s/$/ $APPEND/" /boot/cmdline.txt
+                            echo "Modified cmdline.txt: added ds=nocloud"
+                        fi
+                    fi
+                fi
+
+                # Force HDMI output at 1080p (Pi 5/500 KMS driver)
+                if [ -f /boot/cmdline.txt ]; then
+                    if ! grep -q "video=HDMI-A-1" /boot/cmdline.txt; then
+                        sed -i "s/$/ video=HDMI-A-1:1920x1080M@60/" /boot/cmdline.txt
+                        echo "Modified cmdline.txt: forced HDMI 1080p"
+                    fi
+                fi
+                if [ -f /boot/config.txt ]; then
+                    if ! grep -q "hdmi_force_hotplug" /boot/config.txt; then
+                        echo "" >> /boot/config.txt
+                        echo "# Force HDMI even if not connected at boot" >> /boot/config.txt
+                        echo "hdmi_force_hotplug=1" >> /boot/config.txt
+                        echo "Modified config.txt: added hdmi_force_hotplug=1"
+                    fi
+                fi
+
+                sync
+                umount /boot
+            else
+                echo "WARNING: Could not mount new boot partition $NEW_BOOT"
+            fi
+        else
+            echo "WARNING: New boot partition $NEW_BOOT not found"
+        fi
+        # No old config to restore — we wrote a fresh image
+    else
+        # External target: save log and clean up tryboot files
+        dump_dmesg
+        cp /tmp/selfupdate.log /boot/selfupdate-flash.log 2>/dev/null || true
+        echo "Log saved to boot partition as selfupdate-flash.log"
+        restore_boot  # removes tryboot.txt, cmdline-tryboot.txt, initramfs-tryboot.gz
+    fi
+
+    if [ $FLASH_RC -eq 0 ]; then
+        echo ""
+        echo "============================================"
+        echo "  Flash completed successfully!"
+        echo "============================================"
+        echo ""
+    else
+        echo ""
+        echo "============================================"
+        echo "  Flash FAILED — check the log"
+        echo "============================================"
+        echo ""
+    fi
+
+    sync
+    sleep 1
+    echo "Rebooting..."
+    reboot -f 2>/dev/null
+    # Fallback: force reboot via sysrq
+    sleep 3
+    echo b > /proc/sysrq-trigger
+
+else
+    echo "ERROR: Unknown MODE=$MODE (expected 'flash')"
+    drop_to_shell
+fi

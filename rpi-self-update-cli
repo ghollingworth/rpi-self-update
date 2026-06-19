@@ -1,0 +1,386 @@
+#!/bin/bash
+set -euo pipefail
+
+CATALOG_URL="https://downloads.raspberrypi.com/os_list_imagingutility_v4.json"
+PLATFORM_FILTER="pi5-64bit"
+
+# Parse arguments
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --help|-h)
+            echo "Usage: sudo $0"
+            exit 0 ;;
+        *) echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+done
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+die() {
+    echo -e "${RED}ERROR: $*${NC}" >&2
+    exit 1
+}
+
+# Cleanup temp dir on exit
+TMPDIR=""
+cleanup() {
+    [ -n "$TMPDIR" ] && rm -rf "$TMPDIR"
+}
+trap cleanup EXIT
+
+# Check root
+[ "$(id -u)" -eq 0 ] || die "Must be run as root"
+
+# Check prerequisites
+command -v jq >/dev/null 2>&1 || die "jq is required. Install with: sudo apt install jq"
+command -v curl >/dev/null 2>&1 || die "curl is required. Install with: sudo apt install curl"
+
+echo -e "${BOLD}Raspberry Pi Self-Update — Image Selector${NC}"
+echo ""
+
+# Auto-detect boot device
+ROOT_DEV=$(findmnt -n -o SOURCE / 2>/dev/null || mount | grep ' on / ' | awk '{print $1}')
+case "$ROOT_DEV" in
+    /dev/mmcblk*p*|/dev/nvme*p*)
+        BOOT_DISK=$(echo "$ROOT_DEV" | sed 's/p[0-9]*$//');;
+    /dev/sd*)
+        BOOT_DISK=$(echo "$ROOT_DEV" | sed 's/[0-9]*$//');;
+    *)
+        BOOT_DISK=$(echo "$ROOT_DEV" | sed 's/[0-9]*$//');;
+esac
+echo "Boot device: $BOOT_DISK"
+echo ""
+
+# Fetch catalog
+echo "Fetching Raspberry Pi image catalog..."
+CATALOG=$(curl -sS "$CATALOG_URL") || die "Failed to fetch image catalog"
+
+# Filter images compatible with pi5-64bit — collect top-level items with URLs
+# and subitems with URLs, filtering by devices containing our platform
+IMAGES_JSON=$(echo "$CATALOG" | jq -r --arg pf "$PLATFORM_FILTER" '
+    [
+        .os_list[] |
+        # Check top-level items with a URL
+        (if .url and (.devices // [] | index($pf)) then [.] else [] end) +
+        # Check subitems
+        (if .subitems then
+            [.subitems[] | select(.url and (.devices // [] | index($pf)))]
+        else [] end)
+    ] | flatten
+')
+
+IMAGE_COUNT=$(echo "$IMAGES_JSON" | jq 'length')
+if [ "$IMAGE_COUNT" = "0" ]; then
+    die "No compatible images found for $PLATFORM_FILTER"
+fi
+
+# Display menu
+echo ""
+echo -e "${BOLD}Available images for $PLATFORM_FILTER:${NC}"
+echo ""
+for i in $(seq 0 $((IMAGE_COUNT - 1))); do
+    NAME=$(echo "$IMAGES_JSON" | jq -r ".[$i].name")
+    RELEASE=$(echo "$IMAGES_JSON" | jq -r ".[$i].release_date // \"unknown\"")
+    SIZE=$(echo "$IMAGES_JSON" | jq -r ".[$i].image_download_size // 0")
+    SIZE_MB=$((SIZE / 1024 / 1024))
+    printf "  %3d) %-50s  %s  %4d MB\n" "$((i + 1))" "$NAME" "$RELEASE" "$SIZE_MB"
+done
+
+echo ""
+read -rp "Select image number [1-$IMAGE_COUNT]: " SELECTION
+if ! [ "$SELECTION" -ge 1 ] 2>/dev/null || ! [ "$SELECTION" -le "$IMAGE_COUNT" ] 2>/dev/null; then
+    die "Invalid selection: $SELECTION"
+fi
+
+IDX=$((SELECTION - 1))
+IMAGE_NAME=$(echo "$IMAGES_JSON" | jq -r ".[$IDX].name")
+IMAGE_URL=$(echo "$IMAGES_JSON" | jq -r ".[$IDX].url")
+IMAGE_SHA256=$(echo "$IMAGES_JSON" | jq -r ".[$IDX].extract_sha256 // empty")
+IMAGE_SIZE=$(echo "$IMAGES_JSON" | jq -r ".[$IDX].extract_size // 0")
+
+echo ""
+echo -e "Selected: ${GREEN}$IMAGE_NAME${NC}"
+echo "URL: $IMAGE_URL"
+echo ""
+
+# Ask about home preservation
+PRESERVE_HOME=0
+read -rp "Preserve home directory? [y/N]: " PRESERVE_ANSWER
+case "$PRESERVE_ANSWER" in
+    [yY]|[yY][eE][sS]) PRESERVE_HOME=1 ;;
+esac
+
+if [ "$PRESERVE_HOME" = "1" ]; then
+    # Check if home will fit in RAM (initramfs tmpfs is 80% of total RAM)
+    HOME_SIZE_KB=$(du -sk /home/ 2>/dev/null | cut -f1)
+    MEM_TOTAL_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+    TMPFS_SIZE_KB=$(( MEM_TOTAL_KB * 80 / 100 ))
+    TMPFS_LIMIT_KB=$(( TMPFS_SIZE_KB * 9 / 10 ))  # 90% of tmpfs to leave headroom
+
+    HOME_SIZE_MB=$(( HOME_SIZE_KB / 1024 ))
+    TMPFS_LIMIT_MB=$(( TMPFS_LIMIT_KB / 1024 ))
+
+    if [ "$HOME_SIZE_KB" -gt "$TMPFS_LIMIT_KB" ]; then
+        echo ""
+        echo -e "${RED}Home directory is too large to preserve.${NC}"
+        echo "  Home size:    ${HOME_SIZE_MB} MB"
+        echo "  RAM available: ${TMPFS_LIMIT_MB} MB (for backup)"
+        echo ""
+        echo "Please free up space in /home and try again."
+        echo "Alternatively, run without --preserve-home."
+        exit 1
+    fi
+    echo "  Home size: ${HOME_SIZE_MB} MB (limit: ${TMPFS_LIMIT_MB} MB) — OK"
+fi
+
+# Generate cloud-init files
+TMPDIR=$(mktemp -d /tmp/selfupdate-cloudinit.XXXXXX)
+INSTANCE_ID="selfupdate-$(date +%s)"
+CURRENT_USER=$(logname 2>/dev/null || echo "${SUDO_USER:-pi}")
+CURRENT_HOSTNAME=$(hostname)
+
+echo ""
+echo "Generating cloud-init configuration..."
+
+# meta-data
+cat > "$TMPDIR/meta-data" <<EOF
+instance-id: $INSTANCE_ID
+EOF
+
+# user-data — build it carefully
+cat > "$TMPDIR/user-data" <<USERDATA_EOF
+#cloud-config
+hostname: $CURRENT_HOSTNAME
+manage_etc_hosts: true
+
+packages:
+  - avahi-daemon
+
+apt:
+  preserve_sources_list: true
+  conf: |
+    Acquire::Check-Date "false";
+
+USERDATA_EOF
+
+# Read password hash from /etc/shadow
+PASS_HASH=$(grep "^${CURRENT_USER}:" /etc/shadow 2>/dev/null | cut -d: -f2)
+
+# Use `user:` (singular dict), NOT `users:` (list). The dict form
+# *merges* with cloud-init's default-user template from
+# /etc/cloud/cloud.cfg on the target — fields we set override, fields
+# we omit inherit. We set only what we actually want to carry across
+# (name, password, SSH keys); everything else — groups, sudo, shell,
+# gecos — comes from the target image's default-user template, so we
+# automatically track whatever upstream Pi OS ships (e.g. lpadmin in
+# groups, NOPASSWD sudo, /bin/bash shell).
+#
+# The list form ('users:') would create a brand-new user *alongside*
+# the image's default, which on Pi OS leaves you logged in as a
+# different account from the one you set up. Same trap that bit
+# Raspberry Pi Imager.
+cat >> "$TMPDIR/user-data" <<USERDATA_EOF
+user:
+  name: $CURRENT_USER
+USERDATA_EOF
+
+if [ -n "$PASS_HASH" ] && [ "$PASS_HASH" != "!" ] && [ "$PASS_HASH" != "*" ]; then
+    echo "  lock_passwd: false" >> "$TMPDIR/user-data"
+    echo "  passwd: $PASS_HASH" >> "$TMPDIR/user-data"
+else
+    echo "  lock_passwd: true" >> "$TMPDIR/user-data"
+fi
+
+# Add SSH authorized keys if they exist
+AUTH_KEYS_FILE="/home/$CURRENT_USER/.ssh/authorized_keys"
+if [ -f "$AUTH_KEYS_FILE" ] && [ -s "$AUTH_KEYS_FILE" ]; then
+    echo "  ssh_authorized_keys:" >> "$TMPDIR/user-data"
+    while IFS= read -r key; do
+        [ -n "$key" ] && [[ ! "$key" =~ ^# ]] && echo "    - $key" >> "$TMPDIR/user-data"
+    done < "$AUTH_KEYS_FILE"
+fi
+
+# SSH settings
+cat >> "$TMPDIR/user-data" <<'USERDATA_EOF'
+
+ssh_pwauth: false
+ssh_deletekeys: false
+
+USERDATA_EOF
+
+# Preserve Raspberry Pi Connect state if present
+CONNECT_STATE="/home/$CURRENT_USER/.config/com.raspberrypi.connect/state.json"
+CONNECT_ENABLED=0
+if [ -f "$CONNECT_STATE" ]; then
+    CONNECT_ENABLED=1
+    CONNECT_B64=$(base64 -w0 "$CONNECT_STATE")
+    echo "  Preserved Raspberry Pi Connect state"
+fi
+
+echo "runcmd:" >> "$TMPDIR/user-data"
+echo "  - systemctl enable --now ssh" >> "$TMPDIR/user-data"
+if [ "$CONNECT_ENABLED" = "1" ]; then
+    cat >> "$TMPDIR/user-data" <<USERDATA_EOF
+  - [ sh, -c, "install -o $CURRENT_USER -m 700 -d /home/$CURRENT_USER/.config/com.raspberrypi.connect" ]
+  - [ sh, -c, "echo $CONNECT_B64 | base64 -d > /home/$CURRENT_USER/.config/com.raspberrypi.connect/state.json && chown $CURRENT_USER:$CURRENT_USER /home/$CURRENT_USER/.config/com.raspberrypi.connect/state.json && chmod 600 /home/$CURRENT_USER/.config/com.raspberrypi.connect/state.json" ]
+  - [ sh, -c, "install -o $CURRENT_USER -m 700 -d /home/$CURRENT_USER/.config/systemd/user/default.target.wants /home/$CURRENT_USER/.config/systemd/user/paths.target.wants" ]
+  - [ sh, -c, "UNIT_SRC=/usr/lib/systemd/user/rpi-connect.service; [ -f \$UNIT_SRC ] || UNIT_SRC=/lib/systemd/user/rpi-connect.service; ln -sf \$UNIT_SRC /home/$CURRENT_USER/.config/systemd/user/default.target.wants/rpi-connect.service" ]
+  - [ sh, -c, "UNIT_SRC=/usr/lib/systemd/user/rpi-connect-signin.path; [ -f \$UNIT_SRC ] || UNIT_SRC=/lib/systemd/user/rpi-connect-signin.path; ln -sf \$UNIT_SRC /home/$CURRENT_USER/.config/systemd/user/paths.target.wants/rpi-connect-signin.path" ]
+  - [ sh, -c, "UNIT_SRC=/usr/lib/systemd/user/rpi-connect-wayvnc.service; [ -f \$UNIT_SRC ] || UNIT_SRC=/lib/systemd/user/rpi-connect-wayvnc.service; ln -sf \$UNIT_SRC /home/$CURRENT_USER/.config/systemd/user/default.target.wants/rpi-connect-wayvnc.service" ]
+  - [ sh, -c, "chown -R $CURRENT_USER:$CURRENT_USER /home/$CURRENT_USER/.config/systemd" ]
+  - [ sh, -c, "install -d -m 0755 /var/lib/systemd/linger" ]
+  - [ sh, -c, "install -m 0644 /dev/null /var/lib/systemd/linger/$CURRENT_USER" ]
+  - [ sh, -c, "loginctl enable-linger $CURRENT_USER 2>/dev/null || true" ]
+  - [ sleep, "2" ]
+  - [ sh, -c, "systemctl --quiet --user --machine=$CURRENT_USER@.host daemon-reload || true" ]
+  - [ sh, -c, "systemctl --quiet --user --machine=$CURRENT_USER@.host start rpi-connect.service || true" ]
+  - [ sh, -c, "systemctl --quiet --user --machine=$CURRENT_USER@.host start rpi-connect-signin.path || true" ]
+  - [ sh, -c, "systemctl --quiet --user --machine=$CURRENT_USER@.host start rpi-connect-wayvnc.service || true" ]
+USERDATA_EOF
+fi
+
+# Add SSH host keys
+echo "ssh_keys:" >> "$TMPDIR/user-data"
+for keytype in ed25519 rsa ecdsa; do
+    privkey="/etc/ssh/ssh_host_${keytype}_key"
+    pubkey="/etc/ssh/ssh_host_${keytype}_key.pub"
+    if [ -f "$privkey" ] && [ -f "$pubkey" ]; then
+        echo "  ${keytype}_private: |" >> "$TMPDIR/user-data"
+        sed 's/^/    /' "$privkey" >> "$TMPDIR/user-data"
+        echo "  ${keytype}_public: \"$(cat "$pubkey")\"" >> "$TMPDIR/user-data"
+    fi
+done
+
+# Detect active WiFi via NetworkManager so we can:
+#   - embed creds in the flashed system's network-config (so it auto-
+#     connects on first boot), and
+#   - pass them to rpi-self-update --wifi-ssid/--wifi-psk so the
+#     initramfs can fall back to WiFi if Ethernet has no carrier.
+WIFI_SSID=""
+WIFI_PSK=""
+WIFI_CONN=""
+if command -v nmcli >/dev/null 2>&1; then
+    # Temporarily relax strict-mode so a missing field / failed query doesn't
+    # abort the whole CLI — we handle the empty-result case below.
+    set +e
+    ACTIVE_CONNS=$(nmcli -t -f NAME,TYPE,DEVICE,STATE connection show --active 2>/dev/null)
+    while IFS=: read -r name type _device state; do
+        [ "$type" = "802-11-wireless" ] || continue
+        [ "$state" = "activated" ] || continue
+        MODE=$(nmcli -t -f 802-11-wireless.mode connection show "$name" 2>/dev/null | cut -d: -f2)
+        case "$MODE" in
+            ap|adhoc) continue ;;
+        esac
+        WIFI_CONN="$name"
+        break
+    done <<EOF
+$ACTIVE_CONNS
+EOF
+
+    if [ -n "$WIFI_CONN" ]; then
+        WIFI_SSID=$(nmcli -t -f 802-11-wireless.ssid connection show "$WIFI_CONN" 2>/dev/null | cut -d: -f2)
+        WIFI_PSK=$(nmcli -s -t -f 802-11-wireless-security.psk connection show "$WIFI_CONN" 2>/dev/null | cut -d: -f2)
+    fi
+    set -e
+fi
+
+# Only prompt for WiFi creds when there's no Ethernet carrier — if the
+# cable's plugged in the user shouldn't have to answer WiFi questions.
+# Silent NM detection still runs above and embeds creds as a recovery
+# fallback when both are available; we just skip the interactive prompt.
+HAS_ETHERNET=0
+ETH_IFACE=""
+for iface in eth0 end0; do
+    [ -d "/sys/class/net/$iface" ] || continue
+    if [ "$(cat /sys/class/net/$iface/carrier 2>/dev/null)" = "1" ]; then
+        HAS_ETHERNET=1; ETH_IFACE="$iface"; break
+    fi
+done
+
+if [ -n "$WIFI_SSID" ] && [ -n "$WIFI_PSK" ]; then
+    echo "Detected WiFi: $WIFI_SSID (will be embedded as recovery fallback)"
+elif [ "$HAS_ETHERNET" = "1" ]; then
+    echo "Ethernet present on $ETH_IFACE — skipping WiFi setup."
+    WIFI_SSID=""; WIFI_PSK=""
+elif [ -n "$WIFI_SSID" ] && [ -z "$WIFI_PSK" ]; then
+    echo "Detected WiFi SSID '$WIFI_SSID' but could not read stored PSK."
+    read -rsp "Enter WiFi password for '$WIFI_SSID' (blank to skip): " WIFI_PSK
+    echo ""
+else
+    echo "No active WiFi or Ethernet detected — update will likely fail."
+    read -rp "Enter WiFi SSID (or leave blank for none): " WIFI_SSID
+    if [ -n "$WIFI_SSID" ]; then
+        read -rsp "Enter WiFi password: " WIFI_PSK
+        echo ""
+    fi
+fi
+
+# network-config. WiFi creds (collected just above) are passed through
+# so the freshly-flashed system auto-connects — otherwise a WiFi-only Pi
+# comes up with no network and requires manual setup.
+cat > "$TMPDIR/network-config" <<EOF
+version: 2
+ethernets:
+  eth0:
+    dhcp4: true
+    dhcp6: true
+EOF
+
+if [ -n "$WIFI_SSID" ] && [ -n "$WIFI_PSK" ]; then
+    cat >> "$TMPDIR/network-config" <<EOF
+wifis:
+  wlan0:
+    dhcp4: true
+    access-points:
+      "$WIFI_SSID":
+        password: "$WIFI_PSK"
+EOF
+fi
+
+echo "  meta-data:       $TMPDIR/meta-data"
+echo "  user-data:       $TMPDIR/user-data"
+echo "  network-config:  $TMPDIR/network-config"
+# cmdline-append is auto-generated by rpi-self-update when not provided here.
+
+# Get current IP address (for the summary).
+CURRENT_IP=$(ip -4 addr show | grep 'inet ' | grep -v '127.0.0.1' | awk '{print $2}' | cut -d/ -f1 | head -1)
+
+# Summary
+echo ""
+echo -e "${BOLD}Summary:${NC}"
+echo "  Host:           ${CURRENT_HOSTNAME} (${CURRENT_IP:-no IP})"
+echo "  Image:          $IMAGE_NAME"
+echo "  Target device:  $BOOT_DISK"
+echo "  Preserve home:  $([ "$PRESERVE_HOME" = "1" ] && echo "yes" || echo "no")"
+echo "  User:           $CURRENT_USER"
+echo ""
+
+# Build rpi-self-update command
+PREPARE_ARGS=(
+    --url "$IMAGE_URL"
+    --device "$BOOT_DISK"
+    --cloudinit "$TMPDIR"
+    --image-name "$IMAGE_NAME"
+    -y
+)
+[ -n "$IMAGE_SHA256" ] && PREPARE_ARGS+=(--sha256 "$IMAGE_SHA256")
+[ "$IMAGE_SIZE" -gt 0 ] 2>/dev/null && PREPARE_ARGS+=(--image-size "$IMAGE_SIZE")
+[ "$PRESERVE_HOME" = "1" ] && PREPARE_ARGS+=(--preserve-home)
+[ -n "$WIFI_SSID" ] && PREPARE_ARGS+=(--wifi-ssid "$WIFI_SSID")
+[ -n "$WIFI_PSK" ] && PREPARE_ARGS+=(--wifi-psk "$WIFI_PSK")
+
+echo -e "${YELLOW}This will flash ${BOLD}${CURRENT_HOSTNAME}${NC}${YELLOW} (${CURRENT_IP:-no IP}) with the selected image.${NC}"
+echo -e "${YELLOW}The system will reboot immediately.${NC}"
+read -rp "Proceed? [y/N]: " CONFIRM
+case "$CONFIRM" in
+    [yY]|[yY][eE][sS]) ;;
+    *) echo "Aborted."; exit 0 ;;
+esac
+
+echo ""
+rpi-self-update "${PREPARE_ARGS[@]}"
