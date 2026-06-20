@@ -135,9 +135,18 @@ fi
 # wpa_passphrase SSID PSK prints a config block; we extract the psk= line.
 WIFI_PSK_HASH=""
 if [ -n "$WIFI_SSID" ] && [ -n "$WIFI_PSK" ]; then
-    command -v wpa_passphrase >/dev/null 2>&1 || die "wpa_passphrase not found (install wpasupplicant)"
-    WIFI_PSK_HASH=$(wpa_passphrase "$WIFI_SSID" "$WIFI_PSK" 2>/dev/null | awk -F= '/^[[:space:]]*psk=/ {print $2; exit}')
-    [ -n "$WIFI_PSK_HASH" ] || die "wpa_passphrase failed to hash PSK"
+    # NetworkManager may hand us an already-derived 64-hex-char PSK rather than
+    # a plaintext passphrase (e.g. WiFi configured with a raw key). That is
+    # exactly the value wpa_supplicant.conf wants, so use it verbatim.
+    # wpa_passphrase only accepts 8..63 char passphrases and would reject a
+    # 64-char key — producing an empty hash and aborting the whole prepare.
+    if [[ "$WIFI_PSK" =~ ^[0-9a-fA-F]{64}$ ]]; then
+        WIFI_PSK_HASH="$WIFI_PSK"
+    else
+        command -v wpa_passphrase >/dev/null 2>&1 || die "wpa_passphrase not found (install wpasupplicant)"
+        WIFI_PSK_HASH=$(wpa_passphrase "$WIFI_SSID" "$WIFI_PSK" 2>/dev/null | awk -F= '/^[[:space:]]*psk=/ {print $2; exit}')
+        [ -n "$WIFI_PSK_HASH" ] || die "wpa_passphrase failed to hash PSK"
+    fi
 fi
 
 # Display summary

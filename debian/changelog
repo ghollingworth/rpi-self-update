@@ -1,3 +1,12 @@
+rpi-self-update (1.1-1) unstable; urgency=low
+
+  * Fix prepare aborting when WiFi PSK is an already-derived 64-hex-char key.
+    NetworkManager can return a raw 64-character PSK rather than a plaintext
+    passphrase; wpa_passphrase rejects it (8..63 chars only), leaving the hash
+    empty and aborting the prepare. Use the raw key verbatim in that case.
+
+ -- Gordon Hollingworth <gordon@raspberrypi.com>  Sat, 20 Jun 2026 12:02:39 +0100
+
 rpi-self-update (1.0-1) unstable; urgency=low
 
   * Initial release.
