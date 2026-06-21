@@ -74,16 +74,23 @@ _try_ethernet() {
 
     echo "Using interface: $iface"
     ip link set "$iface" up
-    echo "Waiting for link..."
-    sleep 3
 
-    local carrier
-    carrier=$(cat "/sys/class/net/$iface/carrier" 2>/dev/null || echo 0)
+    # The PHY often isn't ready the instant the interface comes up — the link
+    # negotiates a beat later (notably the Pi 5 Cadence GEM / macb). Poll the
+    # carrier once a second for up to 30s instead of giving up on first check.
+    echo "Waiting for link on $iface (up to 30s)..."
+    local carrier=0 i=0
+    while [ $i -lt 30 ]; do
+        carrier=$(cat "/sys/class/net/$iface/carrier" 2>/dev/null || echo 0)
+        [ "$carrier" = "1" ] && break
+        sleep 1
+        i=$((i + 1))
+    done
     if [ "$carrier" != "1" ]; then
-        echo "No carrier on $iface (cable unplugged?)"
+        echo "No carrier on $iface after ${i}s (cable unplugged?)"
         return 1
     fi
-    echo "Link is up on $iface"
+    echo "Link is up on $iface after ${i}s"
 
     if _dhcp_and_verify "$iface"; then
         return 0

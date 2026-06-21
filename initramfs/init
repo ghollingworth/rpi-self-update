@@ -186,6 +186,25 @@ restore_boot() {
     echo "Tryboot files removed. Next reboot will boot normally."
 }
 
+# Disarm the boot watchdog (armed via kernel_watchdog_timeout in tryboot.txt,
+# optionally handed over from the EEPROM BOOT_WATCHDOG_TIMEOUT). We call this
+# ONLY once we've reached a known-good state — network + SSH up — because from
+# here the flash runs, and a watchdog reset mid-write would corrupt the target
+# filesystem. A hang after this point is still recoverable: SSH is up. The
+# watchdog exists purely to catch a kernel/initramfs that never gets this far.
+# The bcm2835 watchdog reports nowayout=0 + WDIOF_MAGICCLOSE, so writing the
+# magic 'V' and closing the device stops it cleanly.
+disarm_watchdog() {
+    for wd in /dev/watchdog /dev/watchdog0; do
+        if [ -c "$wd" ] && printf 'V' > "$wd" 2>/dev/null; then
+            echo "Watchdog disarmed via $wd — flash cannot be interrupted by a reset."
+            return 0
+        fi
+    done
+    echo "Watchdog: no device to disarm (none armed) — continuing."
+    return 0
+}
+
 # Start network and optional SSH server
 start_network_and_ssh() {
     # WiFi creds embedded by rpi-initramfs --wifi-ssid/--wifi-psk (used in
@@ -211,9 +230,16 @@ start_network_and_ssh() {
         echo "Starting SSH server (dropbear)..."
         mkdir -p /var/log
         : > /var/log/lastlog
-        /usr/sbin/dropbear -R -p 22 2>&1 || echo "WARNING: dropbear failed to start"
-        LOCAL_IP=$(ip -4 addr show | grep 'inet ' | grep -v '127.0.0.1' | awk '{print $2}' | cut -d/ -f1 | head -1)
-        echo "SSH available: ssh root@${LOCAL_IP:-<ip>}"
+        if /usr/sbin/dropbear -R -p 22 2>&1; then
+            LOCAL_IP=$(ip -4 addr show | grep 'inet ' | grep -v '127.0.0.1' | awk '{print $2}' | cut -d/ -f1 | head -1)
+            echo "SSH available: ssh root@${LOCAL_IP:-<ip>}"
+            # Known-good state reached (network + SSH): disarm the watchdog so the
+            # upcoming flash can't be reset mid-write. Only here, not earlier — if
+            # we never get SSH up, leave it armed so the watchdog recovers us.
+            disarm_watchdog
+        else
+            echo "WARNING: dropbear failed to start — leaving watchdog armed"
+        fi
     fi
     return 0
 }

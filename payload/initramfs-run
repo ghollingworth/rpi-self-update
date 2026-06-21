@@ -204,10 +204,6 @@ if [ "$MODE" = "flash" ]; then
                     cp /tmp/selfupdate-cloudinit/network-config /boot/network-config
                     echo "Installed cloud-init files on new boot partition"
 
-                    # Enable SSH — RPi OS native trigger
-                    touch /boot/ssh
-                    echo "Created /boot/ssh (enables SSH on first boot)"
-
                     # Append NoCloud datasource to new cmdline.txt
                     if [ -f /boot/cmdline.txt ] && [ -f /tmp/selfupdate-cloudinit/cmdline-append ]; then
                         APPEND=$(cat /tmp/selfupdate-cloudinit/cmdline-append)

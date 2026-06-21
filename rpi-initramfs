@@ -272,9 +272,29 @@ install_shared_libs() {
         cp "$lib_path" "$lib_dest"
     done
 
-    # Ensure dynamic linker is present
-    local linker="/lib/ld-linux-aarch64.so.1"
-    if [ -f "$linker" ] && [ ! -f "$BUILD_DIR$linker" ]; then
+    # Ensure the dynamic linker is present. ldd (above) normally copies it as
+    # part of each binary's dependency list, but copy it explicitly too as a
+    # belt-and-braces fallback — picking the right one for the build host, since
+    # the initramfs runs under the current (possibly 32-bit) kernel.
+    # Select by *userland* architecture — that's what the bundled binaries are.
+    # dpkg is authoritative (arm64/armhf/armel); a 64-bit kernel with a 32-bit
+    # userland reports armv7l/armv8l from `uname -m`, so use that only as a
+    # fallback and include armv8l.
+    local linker="" host_arch
+    host_arch=$(dpkg --print-architecture 2>/dev/null || true)
+    case "$host_arch" in
+        arm64)  linker="/lib/ld-linux-aarch64.so.1" ;;
+        armhf)  linker="/lib/ld-linux-armhf.so.3" ;;
+        armel)  linker="/lib/ld-linux.so.3" ;;
+        *)      case "$(uname -m)" in
+                    aarch64|arm64)             linker="/lib/ld-linux-aarch64.so.1" ;;
+                    armv8l|armv7l|armv6l|arm)
+                        [ -f /lib/ld-linux-armhf.so.3 ] \
+                            && linker="/lib/ld-linux-armhf.so.3" \
+                            || linker="/lib/ld-linux.so.3" ;;
+                esac ;;
+    esac
+    if [ -n "$linker" ] && [ -f "$linker" ] && [ ! -f "$BUILD_DIR$linker" ]; then
         mkdir -p "$(dirname "$BUILD_DIR$linker")"
         cp "$linker" "$BUILD_DIR$linker"
     fi
@@ -640,6 +660,39 @@ USBBOOT_CFG
     echo "  rpiboot -d $USBBOOT_DIR"
 else
     # ---- normal mode: deploy to local boot partition via tryboot ----
+    # tryboot.txt REPLACES config.txt, so arm_64bit is not inherited. Pin it to
+    # the running kernel's architecture (RPi kernel suffix: v8/2712 = 64-bit,
+    # v7l/v7/v6 = 32-bit) so tryboot reboots a kernel matching THIS initramfs's
+    # modules. Without it, a true 32-bit-kernel board (Pi 3/4, arm_64bit=0) would
+    # tryboot the firmware-default 64-bit kernel and fail to load its modules.
+    # (Pi 5 is always 64-bit, so this just re-asserts arm_64bit=1 there.)
+    TRYBOOT_ARM64=""
+    case "$(uname -r)" in
+        *rpi-v8|*rpi-2712)         TRYBOOT_ARM64=1 ;;
+        *rpi-v7l|*rpi-v7|*rpi-v6)  TRYBOOT_ARM64=0 ;;
+    esac
+
+    # Arm a watchdog for the recovery boot so a kernel/initramfs that never
+    # reaches a usable state self-recovers: it resets, the one-shot tryboot flag
+    # is already consumed, and the firmware boots the normal OS from config.txt.
+    # kernel_watchdog_timeout sets the kernel's watchdog.open_timeout — the time
+    # from OS start until something services the watchdog. The initramfs init
+    # DISARMS it the moment network+SSH are up (see disarm_watchdog in init), so
+    # it can NEVER fire during the flash — a mid-flash reset would corrupt the
+    # target filesystem, which is worse than a hang we can still SSH in to fix.
+    # So this only needs to outlast kernel boot + network/DHCP + SSH bring-up.
+    #
+    # This is self-contained on the boot partition — no EEPROM change needed.
+    # kernel_watchdog_timeout arms the watchdog standalone; it doesn't require
+    # the EEPROM BOOT_WATCHDOG_TIMEOUT. We boot the *current, known-good* kernel
+    # (followkernel), so "the kernel image won't start" isn't a real risk here —
+    # our failure modes are a corrupt initramfs (kernel panics, watchdog fires)
+    # or a hung init (open_timeout fires), both covered once the kernel runs.
+    # (And the EEPROM ships REBOOT_ON_FATAL_ERROR=1, so a fatal bootloader-stage
+    # error self-resets regardless.) Setting BOOT_WATCHDOG_TIMEOUT in the EEPROM
+    # is optional belt-and-braces for a pre-kernel firmware hang only.
+    WATCHDOG_OPEN_TIMEOUT=120
+
     if [ "$DRY_RUN" = "1" ]; then
         echo ""
         echo -e "${BOLD}Dry run — the following would be written to $BOOT_DIR:${NC}"
@@ -649,6 +702,8 @@ else
         echo "  CREATE $BOOT_DIR/tryboot.txt:"
         echo "    # Tryboot config — used for one-shot initramfs boot"
         echo "    # A hard reboot or power cycle will ignore this and use config.txt"
+        [ -n "$TRYBOOT_ARM64" ] && echo "    arm_64bit=$TRYBOOT_ARM64"
+        echo "    kernel_watchdog_timeout=$WATCHDOG_OPEN_TIMEOUT"
         echo "    initramfs initramfs-tryboot.gz followkernel"
         echo "    cmdline cmdline-tryboot.txt"
         echo ""
@@ -680,13 +735,15 @@ else
     echo "  Copied: initramfs-tryboot.gz"
 
     # tryboot.txt — loaded instead of config.txt on tryboot
-    cat > "$BOOT_DIR/tryboot.txt" <<'TRYBOOT_CFG'
-# Tryboot config — used for one-shot initramfs boot
-# A hard reboot or power cycle will ignore this and use config.txt
-initramfs initramfs-tryboot.gz followkernel
-cmdline cmdline-tryboot.txt
-TRYBOOT_CFG
-    echo "  Created: tryboot.txt"
+    {
+        echo "# Tryboot config — used for one-shot initramfs boot"
+        echo "# A hard reboot or power cycle will ignore this and use config.txt"
+        [ -n "$TRYBOOT_ARM64" ] && echo "arm_64bit=$TRYBOOT_ARM64"
+        echo "kernel_watchdog_timeout=$WATCHDOG_OPEN_TIMEOUT"
+        echo "initramfs initramfs-tryboot.gz followkernel"
+        echo "cmdline cmdline-tryboot.txt"
+    } > "$BOOT_DIR/tryboot.txt"
+    echo "  Created: tryboot.txt (arm_64bit=${TRYBOOT_ARM64:-firmware-default}, watchdog open_timeout=${WATCHDOG_OPEN_TIMEOUT}s)"
 
     # Separate cmdline for tryboot
     echo "console=serial0,115200 console=tty1" > "$BOOT_DIR/cmdline-tryboot.txt"

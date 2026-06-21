@@ -151,10 +151,6 @@ install_cloudinit() {
     cp "$CLOUDINIT_SRC/network-config" /tmp/target_boot/network-config
     echo "  Copied: meta-data, user-data, network-config"
 
-    # Enable SSH — RPi OS native trigger
-    touch /tmp/target_boot/ssh
-    echo "  Created: ssh (enables SSH on first boot)"
-
     # Append NoCloud datasource to cmdline.txt if it exists
     if [ -f /tmp/target_boot/cmdline.txt ] && [ -f "$CLOUDINIT_SRC/cmdline-append" ]; then
         APPEND=$(cat "$CLOUDINIT_SRC/cmdline-append")

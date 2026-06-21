@@ -2,7 +2,6 @@
 set -euo pipefail
 
 CATALOG_URL="https://downloads.raspberrypi.com/os_list_imagingutility_v4.json"
-PLATFORM_FILTER="pi5-64bit"
 
 # Parse arguments
 while [ $# -gt 0 ]; do
@@ -56,32 +55,57 @@ esac
 echo "Boot device: $BOOT_DISK"
 echo ""
 
+# Detect the Raspberry Pi model so we can offer the right images. The catalog
+# tags each image with device strings like "pi5-64bit" / "pi4-32bit"; we match
+# any image whose tags start with "<board>-", so both the 32-bit and 64-bit
+# variants for this board are offered. That enables 32-bit installs and 32->64
+# upgrades: the flash overwrites the whole device, so the target architecture
+# is set by the image itself, not by the currently running system.
+detect_board() {
+    local model=""
+    [ -r /proc/device-tree/model ] && model=$(tr -d '\0' < /proc/device-tree/model)
+    case "$model" in
+        *"Raspberry Pi 5"*|*"Compute Module 5"*)                       echo "pi5" ;;
+        *"Raspberry Pi 4"*|*"Raspberry Pi 400"*|*"Compute Module 4"*)  echo "pi4" ;;
+        *"Raspberry Pi 3"*|*"Compute Module 3"*|*"Zero 2"*)            echo "pi3" ;;
+        *"Raspberry Pi 2"*)                                            echo "pi2" ;;
+        *"Raspberry Pi Zero"*|*"Raspberry Pi Model"*|*"Raspberry Pi 1"*) echo "pi1" ;;
+        *) echo "" ;;
+    esac
+}
+BOARD=$(detect_board)
+[ -n "$BOARD" ] || die "Could not detect Raspberry Pi model from /proc/device-tree/model"
+BOARD_MODEL=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo "$BOARD")
+echo "Board: $BOARD_MODEL ($BOARD)"
+echo ""
+
 # Fetch catalog
 echo "Fetching Raspberry Pi image catalog..."
 CATALOG=$(curl -sS "$CATALOG_URL") || die "Failed to fetch image catalog"
 
-# Filter images compatible with pi5-64bit — collect top-level items with URLs
-# and subitems with URLs, filtering by devices containing our platform
-IMAGES_JSON=$(echo "$CATALOG" | jq -r --arg pf "$PLATFORM_FILTER" '
+# Keep only flashable cloud-init images for THIS board. We flatten top-level
+# items and their subitems, then match any image whose device tags start with
+# "<board>-" (so e.g. both pi5-32bit and pi5-64bit are offered). init_format
+# "systemd" images use the legacy firstrun.sh mechanism and cannot consume the
+# cloud-init config we generate, so they are excluded — Trixie-era cloud-init
+# images only.
+IMAGES_JSON=$(echo "$CATALOG" | jq -r --arg board "$BOARD" '
     [
-        .os_list[] |
-        # Check top-level items with a URL
-        (if .url and (.devices // [] | index($pf)) then [.] else [] end) +
-        # Check subitems
-        (if .subitems then
-            [.subitems[] | select(.url and (.devices // [] | index($pf)))]
-        else [] end)
-    ] | flatten
+        .os_list[] | (., (.subitems[]?)) |
+        select(.url
+               and (.devices // [] | any(startswith($board + "-")))
+               and ((.init_format // "") | startswith("cloudinit")))
+    ]
 ')
 
 IMAGE_COUNT=$(echo "$IMAGES_JSON" | jq 'length')
 if [ "$IMAGE_COUNT" = "0" ]; then
-    die "No compatible images found for $PLATFORM_FILTER"
+    die "No compatible cloud-init images found for $BOARD"
 fi
 
 # Display menu
 echo ""
-echo -e "${BOLD}Available images for $PLATFORM_FILTER:${NC}"
+echo -e "${BOLD}Available images for $BOARD_MODEL:${NC}"
 echo ""
 for i in $(seq 0 $((IMAGE_COUNT - 1))); do
     NAME=$(echo "$IMAGES_JSON" | jq -r ".[$i].name")
@@ -205,10 +229,24 @@ if [ -f "$AUTH_KEYS_FILE" ] && [ -s "$AUTH_KEYS_FILE" ]; then
     done < "$AUTH_KEYS_FILE"
 fi
 
-# SSH settings
-cat >> "$TMPDIR/user-data" <<'USERDATA_EOF'
+# Mirror the original system's SSH password-auth policy onto the flashed image:
+# enable cloud-init's ssh_pwauth only if sshd currently permits passwords,
+# otherwise keep the new system key-only. We read the *effective* setting via
+# `sshd -T` so sshd_config.d/ drop-ins are honoured; on any failure we default
+# to the safer key-only (false).
+SSHD_BIN=""
+command -v sshd >/dev/null 2>&1 && SSHD_BIN=sshd
+[ -z "$SSHD_BIN" ] && [ -x /usr/sbin/sshd ] && SSHD_BIN=/usr/sbin/sshd
+SSH_PWAUTH=false
+if [ -n "$SSHD_BIN" ] && "$SSHD_BIN" -T 2>/dev/null | grep -qi '^passwordauthentication yes'; then
+    SSH_PWAUTH=true
+fi
+echo "  SSH password auth: $SSH_PWAUTH (mirrored from this system)"
 
-ssh_pwauth: false
+# SSH settings
+cat >> "$TMPDIR/user-data" <<USERDATA_EOF
+
+ssh_pwauth: $SSH_PWAUTH
 ssh_deletekeys: false
 
 USERDATA_EOF

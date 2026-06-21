@@ -1,3 +1,25 @@
+rpi-self-update (1.2-1) unstable; urgency=low
+
+  * Support 32-bit images and 32<->64-bit switches. Detect the Pi model from
+    /proc/device-tree/model and offer matching 32-bit and 64-bit cloud-init
+    images; the whole-image flash carries the target architecture.
+  * Mirror the running system's SSH password-auth policy onto the flashed
+    image (ssh_pwauth true only if sshd currently permits passwords, read via
+    sshd -T), instead of always disabling it.
+  * Arm a recovery watchdog for the tryboot recovery boot via
+    kernel_watchdog_timeout, and disarm it from the initramfs once network and
+    SSH are up — so a broken/stuck initramfs self-recovers to the normal OS,
+    while a flash in progress can never be reset mid-write.
+  * Pin arm_64bit in tryboot.txt to the running kernel's architecture, since
+    tryboot.txt replaces config.txt and the recovery initramfs must match.
+  * Wait up to 30s for the Ethernet carrier in the initramfs rather than
+    checking once (Pi 5 link negotiation is not instant).
+  * Select the initramfs dynamic linker by host userland architecture
+    (arm64/armhf/armel) instead of hardcoding aarch64.
+  * Drop the legacy /boot/ssh first-boot trigger; SSH is enabled via cloud-init.
+
+ -- Gordon Hollingworth <gordon@raspberrypi.com>  Sun, 21 Jun 2026 19:43:00 +0100
+
 rpi-self-update (1.1-1) unstable; urgency=low
 
   * Fix prepare aborting when WiFi PSK is an already-derived 64-hex-char key.
