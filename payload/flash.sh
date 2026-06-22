@@ -32,6 +32,21 @@ flash_image() {
     local start_time
     start_time=$(date +%s)
 
+    # wget -q and dd status=none are silent for the whole multi-minute write,
+    # which has led users to think the flash hung and interrupt it mid-write.
+    # Emit a heartbeat (MiB written, from the block device's sysfs stats) every
+    # few seconds so the live log (tail -f) shows real progress.
+    local hb_dev
+    hb_dev=$(basename "$TARGET_DEVICE")
+    (
+        while :; do
+            sleep 5
+            sectors=$(awk '{print $7}' "/sys/block/$hb_dev/stat" 2>/dev/null)
+            [ -n "$sectors" ] && echo "  ...writing ${sectors:+$((sectors / 2048))} MiB ($(( $(date +%s) - start_time ))s elapsed)"
+        done
+    ) &
+    local hb_pid=$!
+
     # Run the pipeline with stderr going directly to console, not through the logpipe.
     # This avoids SIGPIPE issues if the tee logging process dies during the long download.
     if [ "$needs_xz" = "1" ]; then
@@ -43,6 +58,7 @@ flash_image() {
     fi
 
     local rc=$?
+    kill "$hb_pid" 2>/dev/null
     local end_time
     end_time=$(date +%s)
     local elapsed=$((end_time - start_time))

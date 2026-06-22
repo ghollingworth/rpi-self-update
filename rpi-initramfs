@@ -464,8 +464,9 @@ cat > "$BUILD_DIR/etc/motd" <<'MOTD'
 
   Raspberry Pi Self-Update Initramfs
   -----------------------------------
-  Type "restore" to clean up and reboot back to the normal OS.
-  (A hard reboot or power cycle will also return to the normal system.)
+  If a flash is in progress, DO NOT interrupt it — the Pi reboots itself
+  when it finishes.  Watch it:  tail -f /tmp/selfupdate.log
+  To return to the old OS when NO flash is running:  restore
 
 MOTD
 

@@ -8,6 +8,19 @@
 # to remove the tryboot files. Even without running this, a hard reboot
 # or power cycle will boot normally since tryboot is one-shot.
 
+# Refuse to interrupt an in-progress flash — restore does a forced reboot, and
+# doing that mid-write corrupts the partially-written image. The flash reboots
+# the Pi automatically when it finishes, so waiting is always the right move.
+if [ -f /run/flash-in-progress ] && [ "${1:-}" != "--force" ]; then
+    echo ""
+    echo "*** A FLASH IS IN PROGRESS — 'restore' is blocked. ***"
+    echo "Interrupting it now will CORRUPT the new OS being written to disk."
+    echo "The Pi reboots itself automatically when the flash finishes."
+    echo "Watch it:    tail -f /tmp/selfupdate.log"
+    echo "Abort only if you are certain it is hung:    restore --force"
+    exit 1
+fi
+
 echo ""
 echo "=== Cleaning up tryboot files and rebooting ==="
 

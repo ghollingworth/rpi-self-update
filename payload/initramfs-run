@@ -156,7 +156,12 @@ if [ "$MODE" = "flash" ]; then
         fi
     fi
 
-    # Flash
+    # Flash. Mark the destructive window: while this marker exists, SSH logins
+    # show live progress and 'restore' refuses to act — a forced reboot during
+    # the write would corrupt the partially-written image. Covers the dd plus
+    # the post-flash boot-partition/cloud-init setup; cleared just before the
+    # automatic reboot below.
+    : > /run/flash-in-progress
     . "$PAYLOAD_DIR/flash.sh"
     flash_image
     FLASH_RC=$?
@@ -261,6 +266,7 @@ if [ "$MODE" = "flash" ]; then
         echo ""
     fi
 
+    rm -f /run/flash-in-progress
     sync
     sleep 1
     echo "Rebooting..."

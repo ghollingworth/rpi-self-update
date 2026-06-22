@@ -263,6 +263,26 @@ export PAYLOAD_DIR="$PAYLOAD_DIR"
 export PATH="/sbin:/usr/sbin:/bin:/usr/bin"
 PROFILE
 
+# On interactive login while a flash is running, show live progress instead of
+# a bare shell (which used to invite a dangerous 'restore' mid-write). Ctrl-C
+# leaves the progress view and drops to a shell; 'restore' stays blocked until
+# the flash finishes.
+cat >> /etc/profile <<'PROFILE_FLASH'
+if [ -t 0 ] && [ -f /run/flash-in-progress ]; then
+    echo "############################################################"
+    echo "#  SELF-UPDATE FLASH IN PROGRESS                           #"
+    echo "#  DO NOT power off, reboot, or run 'restore' — that will  #"
+    echo "#  corrupt the new OS image being written to disk.         #"
+    echo "#  The Pi reboots itself automatically when it finishes.   #"
+    echo "#  Live log below — press Ctrl-C for a shell.              #"
+    echo "############################################################"
+    tail -n 25 -f /tmp/selfupdate.log
+    echo ""
+    echo "Left the progress view. The flash may still be running, so 'restore'"
+    echo "stays blocked. Re-run 'tail -f /tmp/selfupdate.log' to watch again."
+fi
+PROFILE_FLASH
+
 if [ -f /payload/initramfs-run ]; then
     set +e
     . /payload/initramfs-run

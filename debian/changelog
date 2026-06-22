@@ -1,3 +1,18 @@
+rpi-self-update (1.3-1) unstable; urgency=low
+
+  * Prevent corrupting a flash by interrupting it. While the image is being
+    written, an SSH login now shows a live-progress view with a clear "do not
+    interrupt" banner instead of a bare shell, and `restore` refuses to act
+    (use `restore --force` to override). Previously a user who SSH'd in
+    mid-write and ran `restore` would force-reboot during the dd and leave a
+    half-written, unbootable image.
+  * Show real progress during the otherwise-silent download/write phase
+    (MiB written, from the block device's sysfs stats), so the flash no longer
+    looks hung.
+  * MOTD no longer unconditionally tells the user to run `restore`.
+
+ -- Gordon Hollingworth <gordon@raspberrypi.com>  Mon, 22 Jun 2026 10:50:07 +0100
+
 rpi-self-update (1.2-1) unstable; urgency=low
 
   * Support 32-bit images and 32<->64-bit switches. Detect the Pi model from
