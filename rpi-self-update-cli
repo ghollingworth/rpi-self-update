@@ -231,15 +231,23 @@ fi
 
 # Mirror the original system's SSH password-auth policy onto the flashed image:
 # enable cloud-init's ssh_pwauth only if sshd currently permits passwords,
-# otherwise keep the new system key-only. We read the *effective* setting via
-# `sshd -T` so sshd_config.d/ drop-ins are honoured; on any failure we default
-# to the safer key-only (false).
+# otherwise keep the new system key-only. We read the *effective* setting
+# (so sshd_config.d/ drop-ins are honoured) via `sshd -G`, NOT `-T`:
+# `-T` loads the host keys and fully validates the config, so a missing/
+# unreadable host key (or any strict-mode quirk) makes it exit with no output
+# — which we'd silently misread as "no" and wrongly disable password auth.
+# `-G` (OpenSSH 8.4+) just dumps the effective config without loading keys, so
+# it reports PasswordAuthentication reliably. Fall back to -T on older sshd.
 SSHD_BIN=""
 command -v sshd >/dev/null 2>&1 && SSHD_BIN=sshd
 [ -z "$SSHD_BIN" ] && [ -x /usr/sbin/sshd ] && SSHD_BIN=/usr/sbin/sshd
 SSH_PWAUTH=false
-if [ -n "$SSHD_BIN" ] && "$SSHD_BIN" -T 2>/dev/null | grep -qi '^passwordauthentication yes'; then
-    SSH_PWAUTH=true
+if [ -n "$SSHD_BIN" ]; then
+    SSHD_CFG=$("$SSHD_BIN" -G 2>/dev/null || true)
+    [ -n "$SSHD_CFG" ] || SSHD_CFG=$("$SSHD_BIN" -T 2>/dev/null || true)
+    if printf '%s\n' "$SSHD_CFG" | grep -qi '^passwordauthentication yes'; then
+        SSH_PWAUTH=true
+    fi
 fi
 echo "  SSH password auth: $SSH_PWAUTH (mirrored from this system)"
 
@@ -260,8 +268,34 @@ if [ -f "$CONNECT_STATE" ]; then
     echo "  Preserved Raspberry Pi Connect state"
 fi
 
+# Mirror this system's WiFi regulatory country into the image, like Raspberry
+# Pi Imager — otherwise RPi OS leaves WiFi rfkill-blocked (it stays blocked
+# until a country is set). Detected from raspi-config / iw / crda; empty if none.
+WIFI_COUNTRY=""
+if command -v raspi-config >/dev/null 2>&1; then
+    WIFI_COUNTRY=$(raspi-config nonint get_wifi_country 2>/dev/null | tr -dc 'A-Za-z')
+fi
+if [ -z "$WIFI_COUNTRY" ] && command -v iw >/dev/null 2>&1; then
+    WIFI_COUNTRY=$(iw reg get 2>/dev/null | sed -n 's/^country \([A-Z][A-Z]\):.*/\1/p' | head -1)
+fi
+if [ -z "$WIFI_COUNTRY" ] && [ -f /etc/default/crda ]; then
+    WIFI_COUNTRY=$(. /etc/default/crda 2>/dev/null; printf '%s' "${REGDOMAIN:-}")
+fi
+WIFI_COUNTRY=$(printf '%s' "$WIFI_COUNTRY" | tr 'a-z' 'A-Z')
+case "$WIFI_COUNTRY" in [A-Z][A-Z]) ;; *) WIFI_COUNTRY="" ;; esac
+[ -n "$WIFI_COUNTRY" ] && echo "  WiFi country: $WIFI_COUNTRY (mirrored from this system)"
+
 echo "runcmd:" >> "$TMPDIR/user-data"
 echo "  - systemctl enable --now ssh" >> "$TMPDIR/user-data"
+# Unblock WiFi and clear the persisted systemd-rfkill state so it survives a
+# reboot — exactly the commands Imager emits. The regulatory-domain in the
+# network-config (below) sets the actual regdomain when WiFi creds are present.
+if [ -n "$WIFI_COUNTRY" ]; then
+    cat >> "$TMPDIR/user-data" <<'WIFI_RFKILL'
+  - [ rfkill, unblock, wifi ]
+  - [ sh, -c, "for f in /var/lib/systemd/rfkill/*:wlan; do echo 0 > \"$f\"; done" ]
+WIFI_RFKILL
+fi
 if [ "$CONNECT_ENABLED" = "1" ]; then
     cat >> "$TMPDIR/user-data" <<USERDATA_EOF
   - [ sh, -c, "install -o $CURRENT_USER -m 700 -d /home/$CURRENT_USER/.config/com.raspberrypi.connect" ]
@@ -367,17 +401,21 @@ ethernets:
   eth0:
     dhcp4: true
     dhcp6: true
+    optional: true
 EOF
 
 if [ -n "$WIFI_SSID" ] && [ -n "$WIFI_PSK" ]; then
-    cat >> "$TMPDIR/network-config" <<EOF
-wifis:
-  wlan0:
-    dhcp4: true
-    access-points:
-      "$WIFI_SSID":
-        password: "$WIFI_PSK"
-EOF
+    # Set the regulatory-domain on wlan0 (like Imager) so WiFi isn't left
+    # rfkill-blocked on the flashed system.
+    {
+        echo "wifis:"
+        echo "  wlan0:"
+        echo "    dhcp4: true"
+        [ -n "$WIFI_COUNTRY" ] && echo "    regulatory-domain: \"$WIFI_COUNTRY\""
+        echo "    access-points:"
+        echo "      \"$WIFI_SSID\":"
+        echo "        password: \"$WIFI_PSK\""
+    } >> "$TMPDIR/network-config"
 fi
 
 echo "  meta-data:       $TMPDIR/meta-data"

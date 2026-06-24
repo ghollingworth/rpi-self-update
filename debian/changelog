@@ -1,3 +1,21 @@
+rpi-self-update (1.4-1) unstable; urgency=low
+
+  * Detect the source SSH password-auth policy with `sshd -G` instead of `-T`.
+    `-T` loads the host keys and aborts with no output if one is missing or
+    unreadable, which we silently misread as "disabled" and wrongly turned off
+    password authentication on the flashed system. `-G` dumps the effective
+    config without loading keys; fall back to `-T` on OpenSSH older than 8.4.
+  * Carry the WiFi regulatory country onto the flashed image, like Raspberry Pi
+    Imager: set the network-config wifis `regulatory-domain`, and (whenever a
+    country is known) unblock WiFi via runcmd — `rfkill unblock wifi` plus
+    clearing the persisted /var/lib/systemd/rfkill state so it survives reboot.
+    Without this the flashed system left WiFi rfkill-blocked.
+  * Resolve stable-alias root sources (e.g. /dev/disk/by-slot/system, by-uuid)
+    to the real /dev node, so whole-disk detection and self-update mode work on
+    images that mount root via an alias.
+
+ -- Gordon Hollingworth <gordon@raspberrypi.com>  Wed, 24 Jun 2026 17:53:06 +0100
+
 rpi-self-update (1.3-1) unstable; urgency=low
 
   * Prevent corrupting a flash by interrupting it. While the image is being
